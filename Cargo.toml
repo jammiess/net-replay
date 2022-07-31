@@ -9,7 +9,7 @@ repository = "https://github.com/jammiess/net-replay"
 license = "WTFPL"
 keywords = ["network"]
 categories = ["network-programming"]
-exclude = ["fuzz/", "test/"]
+exclude = ["fuzz/"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
