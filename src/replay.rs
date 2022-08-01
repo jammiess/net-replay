@@ -16,11 +16,11 @@
 //!
 //! See the [`AddressArbiter`] struct for an example implementation of the trait.
 
-use crate::ip::{IpPacket, TcpFlags};
+use crate::ip::{DataType, IpPacket, TcpFlags};
 
+use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpStream};
 use std::num::NonZeroUsize;
-use std::io::{self, Read, Write};
 
 /// Enum for what to do with a packet from a capture
 #[derive(Debug)]
@@ -89,27 +89,30 @@ impl Arbiter for AddressArbiter {
     fn decide(&mut self, packet: &IpPacket) -> Action {
         const CONN_END: TcpFlags = TcpFlags::RST.union(TcpFlags::FIN);
 
-        // Check if this is a packet that should be sent in the replay
-        if self.host == packet.dest && self.client == packet.source {
-            // Has the right destination and source, now check that actually data was sent
-            if packet.payload.flags.contains(TcpFlags::PSH) {
-                return Action::Send(None);
+        // If the packet is not a TCP packet just skip it
+        if let DataType::TCP(ref payload) = packet.payload {
+            // Check if this is a packet that should be sent in the replay
+            if self.host == packet.dest && self.client == packet.source {
+                // Has the right destination and source, now check that actually data was sent
+                if payload.flags.contains(TcpFlags::PSH) {
+                    return Action::Send(None);
+                }
+                // Check if connection got reset and break if it did
+                if payload.flags.intersects(CONN_END) {
+                    return Action::Break;
+                }
             }
-            // Check if connection got reset and break if it did
-            if packet.payload.flags.intersects(CONN_END) {
-                return Action::Break;
-            }
-        }
 
-        // Check if the client should receive some data from the host
-        if self.host == packet.source && self.client == packet.dest {
-            // Check if any data was actually sent in this packet
-            if packet.payload.flags.contains(TcpFlags::PSH) {
-                return Action::Recv(None);
-            }
-            // Check if the connection got reset and break if it did
-            if packet.payload.flags.intersects(CONN_END) {
-                return Action::Break;
+            // Check if the client should receive some data from the host
+            if self.host == packet.source && self.client == packet.dest {
+                // Check if any data was actually sent in this packet
+                if payload.flags.contains(TcpFlags::PSH) {
+                    return Action::Recv(None);
+                }
+                // Check if the connection got reset and break if it did
+                if payload.flags.intersects(CONN_END) {
+                    return Action::Break;
+                }
             }
         }
 
@@ -164,7 +167,7 @@ impl Replayer {
                     if let Some(data) = payload {
                         self.socket.write_all(&data)?;
                     } else {
-                        self.socket.write_all(&packet.payload.data)?;
+                        self.socket.write_all(packet.payload.get_payload())?;
                     }
                 }
                 Action::Recv(read_size) => {
@@ -176,7 +179,7 @@ impl Replayer {
                         read_bytes = self.socket.read(&mut recv_buf[..])?;
                     }
                     self.arbiter
-                        .update(&recv_buf[..read_bytes], &packet.payload.data);
+                        .update(&recv_buf[..read_bytes], packet.payload.get_payload());
                 }
                 Action::Break => break,
             }
