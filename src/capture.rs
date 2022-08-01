@@ -11,8 +11,7 @@
 //! that data over a TCP connection.
 
 use crate::ip::IpPacket;
-use crate::sock::Raw;
-use crate::RSockErr;
+use crate::sock::{Raw, RSockErr};
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;

@@ -20,5 +20,4 @@ pub mod ip;
 pub mod capture;
 pub mod replay;
 #[cfg(target_os="linux")]
-mod sock;
-pub use sock::{RSockErr, Raw};
+pub mod sock;
