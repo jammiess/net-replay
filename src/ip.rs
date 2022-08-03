@@ -78,7 +78,7 @@ pub enum IpParseErr {
 #[derive(Debug)]
 pub enum DataType {
     TCP(TcpPacket),
-    UDP(UdpPacket),
+    UDP(UdpDatagram),
 }
 
 impl DataType {
@@ -114,8 +114,8 @@ impl From<TcpPacket> for DataType {
     }
 }
 
-impl From<UdpPacket> for DataType {
-    fn from(packet: UdpPacket) -> Self {
+impl From<UdpDatagram> for DataType {
+    fn from(packet: UdpDatagram) -> Self {
         Self::UDP(packet)
     }
 }
@@ -225,16 +225,16 @@ impl IpPacket {
         }
         let dscp = (data[1] & 0xfc) >> 2;
         let ecn = data[1] & 0x3;
-        let len: usize = (usize::from(data[2]) << 0x8) + usize::from(data[3]);
+        let len = u16::from_be_bytes(data[2..4].try_into().unwrap()) as usize;
         if len > data.len() {
             return Err(IpParseErr::InvalidSize(len));
         }
-        let id: u16 = (u16::from(data[4]) << 0x8) + u16::from(data[5]);
+        let id = u16::from_be_bytes(data[4..6].try_into().unwrap());
         let flags = data[6] >> 5;
         let frag_off: u16 = (u16::from(data[6] & 0x1f) << 8) + u16::from(data[7]);
         let ttl = data[8];
         let proto = data[9];
-        let checksum: u16 = (u16::from(data[10]) << 8) + u16::from(data[11]);
+        let checksum = u16::from_be_bytes(data[10..12].try_into().unwrap());
         let source = Ipv4Addr::new(data[12], data[13], data[14], data[15]);
         let dest = Ipv4Addr::new(data[16], data[17], data[18], data[19]);
         let end: usize;
@@ -250,7 +250,7 @@ impl IpPacket {
         }
         let payload: DataType = match proto {
             6 => TcpPacket::parse_from_bytes(&&data[end..len])?.into(),
-            17 => UdpPacket::parse_from_bytes(&&data[end..len])?.into(),
+            17 => UdpDatagram::parse_from_bytes(&&data[end..len])?.into(),
             p => return Err(IpParseErr::Proto(p)),
         };
         Ok(IpPacket {
@@ -409,16 +409,10 @@ impl TcpPacket {
         if data.len() < 20 {
             return Err(TcpParseErr::Size(data.len()));
         }
-        let source: u16 = (u16::from(data[0]) << 8) + u16::from(data[1]);
-        let dest: u16 = (u16::from(data[2]) << 8) + u16::from(data[3]);
-        let seq: u32 = (u32::from(data[4]) << 24)
-            + (u32::from(data[5]) << 16)
-            + (u32::from(data[6]) << 8)
-            + u32::from(data[7]);
-        let ack: u32 = (u32::from(data[8]) << 24)
-            + (u32::from(data[9]) << 16)
-            + (u32::from(data[10]) << 8)
-            + u32::from(data[11]);
+        let source = u16::from_be_bytes(data[0..2].try_into().unwrap());
+        let dest = u16::from_be_bytes(data[2..4].try_into().unwrap());
+        let seq = u32::from_be_bytes(data[4..8].try_into().unwrap());
+        let ack = u32::from_be_bytes(data[8..12].try_into().unwrap());
         let data_off = data[12] >> 4;
         if data_off as usize * 4 > data.len() {
             return Err(TcpParseErr::InvalidSize(data_off as usize));
@@ -429,9 +423,9 @@ impl TcpPacket {
         // The high order bits from the packet that don't match up to flags are masked out
         // so this should be completely fine.
         let flags: TcpFlags = unsafe { transmute(flag_bits) };
-        let window: u16 = (u16::from(data[14]) << 8) + u16::from(data[15]);
-        let checksum: u16 = (u16::from(data[16]) << 8) + u16::from(data[17]);
-        let urg: u16 = (u16::from(data[18]) << 8) + u16::from(data[19]);
+        let window = u16::from_be_bytes(data[14..16].try_into().unwrap());
+        let checksum = u16::from_be_bytes(data[16..18].try_into().unwrap());
+        let urg = u16::from_be_bytes(data[18..20].try_into().unwrap());
         let option_data: Option<Vec<u8>> = if data_off > 5 {
             Some(data[20..(data_off as usize) * 4].to_vec())
         } else {
@@ -494,7 +488,7 @@ pub enum UdpParseErr {
 }
 
 /// UDP header and associated data
-pub struct UdpPacket {
+pub struct UdpDatagram {
     /// Source port
     pub source: u16,
     /// Destination port
@@ -505,7 +499,7 @@ pub struct UdpPacket {
     pub payload: Vec<u8>,
 }
 
-impl fmt::Debug for UdpPacket {
+impl fmt::Debug for UdpDatagram {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UDP Packet")
             .field("Source Port", &self.source)
@@ -515,7 +509,7 @@ impl fmt::Debug for UdpPacket {
     }
 }
 
-impl UdpPacket {
+impl UdpDatagram {
     /// Parse a udp packet from a slice of bytes
     ///
     /// This method will not check the checksum.
@@ -528,11 +522,10 @@ impl UdpPacket {
         if data.len() < 8 {
             return Err(UdpParseErr::MissingHeader);
         }
-        let source = ((data[0] as u16) << 8) + (data[1] as u16);
-        let dest = ((data[2] as u16) << 8) + (data[3] as u16);
-        let length = ((data[4] as u16) << 8) + (data[5] as u16);
-        let length = length as usize;
-        let checksum = ((data[6] as u16) << 8) + (data[7] as u16);
+        let source = u16::from_be_bytes(data[0..2].try_into().unwrap());
+        let dest = u16::from_be_bytes(data[2..4].try_into().unwrap());
+        let length = u16::from_be_bytes(data[4..6].try_into().unwrap()) as usize;
+        let checksum = u16::from_be_bytes(data[6..8].try_into().unwrap());
         if !(8..data.len()).contains(&length) {
             return Err(UdpParseErr::SizeMismatch);
         }
@@ -695,7 +688,7 @@ mod ip_testing {
     fn test_fuzz_crash_pcap_read() {
         use std::fs::File;
         let mut file =
-            File::open("fuzz/artifacts/pcap-read/crash-aef6cb9fec5fd0207962b119bae267071475e9af")
+            File::open("test/test.pcap")
                 .unwrap();
         let _data = read_pcap_file(&mut file);
     }
