@@ -1,6 +1,6 @@
 [package]
 name = "net-replay"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["James"]
 description = "Capture and replay TCP/IP traffic"

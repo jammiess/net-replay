@@ -3,16 +3,17 @@
 //! This module has functionality and limitations very specific to its use case. Do not use this as a general
 //! purpose packet parsing module.
 //!
-//! This module provides functionality for parsing TCP/IP packets from a raw socket and reading and writing TCP/IP
-//! packets from a pcap file. The functionality in this module is mainly meant as utility for the rest of the library.
-//! As a user of the library, you should really only need to use [`read_pcap_file`] and [`write_pcap_file`] as well as
-//! the public types.
+//! This module provides functionality for parsing TCP/IP and UDP/IP packets from a raw socket and reading and writing
+//! those packets from a pcap file. The functionality in this module is mainly meant as utility for the rest of the
+//! library. As a user of the library, you should really only need to use [`read_pcap_file`] and [`write_pcap_file`] as
+//! well as the public types.
 
+use std::convert::From;
 use std::fmt;
+use std::io::{Read, Write};
 use std::mem::transmute;
 use std::net::Ipv4Addr;
-use std::time::{SystemTime, Duration};
-use std::io::{Read, Write};
+use std::time::{Duration, SystemTime};
 
 use bitflags::bitflags;
 use thiserror::Error;
@@ -29,8 +30,8 @@ pub enum IpParseErr {
     /// IP packet was not version 4. Contains the parsed version.
     #[error("Found version {0}, expected 4")]
     Version(u8),
-    /// IP packet was not for the TCP protocol. Contains the parsed protocol number.
-    #[error("Found protocol {0}, expected 6")]
+    /// IP packet encapsulated an unsupported protocol
+    #[error("Found protocol {0}")]
     Proto(u8),
     /// Not enough bytes to be an IP header. Minimum of 20. Contains size of passed buffer.
     #[error("IPv4 header is 20 bytes, only passed a buffer of size {0}")]
@@ -38,6 +39,9 @@ pub enum IpParseErr {
     /// Error occured when parsing the TCP portion of the payload.
     #[error("Failed to parse the TCP payload")]
     Tcp(#[from] TcpParseErr),
+    /// Failed to parse the underlying udp packet
+    #[error("Error occurred while parsing UDP payload")]
+    Udp(#[from] UdpParseErr),
     /// IP header contained options. This struct doesn't support those.
     #[error("This library doesn't support ip options")]
     Options,
@@ -64,8 +68,60 @@ pub enum IpParseErr {
     PcapFileSize,
 }
 
+/// Data that the IP packet encapsulates
+///
+/// An IP packet can encapsulate many different types of data. Each possible encapsulated type that this library
+/// supports is represented by this enum.
+///
+/// This enum is marked as non-exhaustive as more underlying types may be added in future versions of the library.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum DataType {
+    TCP(TcpPacket),
+    UDP(UdpDatagram),
+}
+
+impl DataType {
+    /// Write the underlying protocol data to the pcap file
+    ///
+    /// # Errors
+    /// Will return any io errors that occur
+    pub fn pcap_write<W: Write>(&self, f: &mut W) -> std::io::Result<()> {
+        match self {
+            Self::TCP(p) => p.pcap_write(f),
+            Self::UDP(p) => p.pcap_write(f),
+        }
+    }
+
+    pub fn get_proto_num(&self) -> u8 {
+        match self {
+            Self::TCP(_) => 6,
+            Self::UDP(_) => 17,
+        }
+    }
+
+    pub fn get_payload(&self) -> &Vec<u8> {
+        match self {
+            Self::TCP(p) => &p.data,
+            Self::UDP(p) => &p.payload,
+        }
+    }
+}
+
+impl From<TcpPacket> for DataType {
+    fn from(packet: TcpPacket) -> Self {
+        Self::TCP(packet)
+    }
+}
+
+impl From<UdpDatagram> for DataType {
+    fn from(packet: UdpDatagram) -> Self {
+        Self::UDP(packet)
+    }
+}
+
 /// IP header and its associated TCP data
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct IpPacket {
     /// Differentiated Services Code Point
     ///
@@ -118,10 +174,10 @@ pub struct IpPacket {
     /// Any options the IP header may have. This field will only contain a vector if the IHL field is in the range
     /// [6, 15].
     pub options: Option<Vec<u8>>,
-    /// TCP Packet
+    /// Encapsulated data
     ///
-    /// The tcp packet contained within this IP packet.
-    pub payload: TcpPacket,
+    /// The payload can be any of the supported types in the [`DataType`] enum
+    pub payload: DataType,
     /// Time packet received at
     ///
     /// This field is populated at the time the packet was parsed at and may not perfectly reflect the time at which
@@ -142,7 +198,10 @@ impl IpPacket {
     /// # Panics
     /// This method may panic. If the system time is before the [`SystemTime::UNIX_EPOCH`] time, then a panic will
     /// occur.
-    pub fn parse_from_bytes(data: &dyn AsRef<[u8]>, time: Option<SystemTime>) -> Result<Self, IpParseErr> {
+    pub fn parse_from_bytes(
+        data: &dyn AsRef<[u8]>,
+        time: Option<SystemTime>,
+    ) -> Result<Self, IpParseErr> {
         // This should never fail. The only times that this would fail is if the current system time is from before the
         // unix epoch. I feel safe in assuming that the system time will never drift that far.
         let recv_time = match time {
@@ -166,19 +225,16 @@ impl IpPacket {
         }
         let dscp = (data[1] & 0xfc) >> 2;
         let ecn = data[1] & 0x3;
-        let len: usize = (usize::from(data[2]) << 0x8) + usize::from(data[3]);
+        let len = u16::from_be_bytes(data[2..4].try_into().unwrap()) as usize;
         if len > data.len() {
             return Err(IpParseErr::InvalidSize(len));
         }
-        let id: u16 = (u16::from(data[4]) << 0x8) + u16::from(data[5]);
+        let id = u16::from_be_bytes(data[4..6].try_into().unwrap());
         let flags = data[6] >> 5;
         let frag_off: u16 = (u16::from(data[6] & 0x1f) << 8) + u16::from(data[7]);
         let ttl = data[8];
         let proto = data[9];
-        if proto != 6 {
-            return Err(IpParseErr::Proto(proto));
-        }
-        let checksum: u16 = (u16::from(data[10]) << 8) + u16::from(data[11]);
+        let checksum = u16::from_be_bytes(data[10..12].try_into().unwrap());
         let source = Ipv4Addr::new(data[12], data[13], data[14], data[15]);
         let dest = Ipv4Addr::new(data[16], data[17], data[18], data[19]);
         let end: usize;
@@ -192,7 +248,11 @@ impl IpPacket {
         if len < end {
             return Err(IpParseErr::Size(len));
         }
-        let payload = TcpPacket::parse_from_bytes(&&data[end..len]).map_err(IpParseErr::Tcp)?;
+        let payload: DataType = match proto {
+            6 => TcpPacket::parse_from_bytes(&&data[end..len])?.into(),
+            17 => UdpDatagram::parse_from_bytes(&&data[end..len])?.into(),
+            p => return Err(IpParseErr::Proto(p)),
+        };
         Ok(IpPacket {
             dscp,
             ecn,
@@ -215,7 +275,10 @@ impl IpPacket {
     /// # Errors
     /// Returns an error if any of the writes fail.
     pub fn pcap_write<W: Write>(&self, file: &mut W) -> std::io::Result<()> {
-        let diff = self.recv_time.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+        let diff = self
+            .recv_time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
         let secs = diff.as_secs() as u32;
         let nanos = diff.as_nanos() as u32;
         file.write_all(&secs.to_ne_bytes())?;
@@ -234,7 +297,7 @@ impl IpPacket {
         let frag_off = ((self.flags as u16) << 13) | self.frag_off;
         file.write_all(&frag_off.to_be_bytes())?;
         file.write_all(&self.ttl.to_be_bytes())?;
-        file.write_all(&6_u8.to_be_bytes())?;
+        file.write_all(&self.payload.get_proto_num().to_be_bytes())?;
         file.write_all(&self.checksum.to_be_bytes())?;
         file.write_all(&self.source.octets())?;
         file.write_all(&self.dest.octets())?;
@@ -251,10 +314,9 @@ impl fmt::Display for IpPacket {
         f.debug_struct("IPv4 Header")
             .field("Total length", &self.len)
             .field("Source addr", &self.source)
-            .field("Source port", &self.payload.source)
             .field("Dest addr", &self.dest)
-            .field("Dest port", &self.payload.dest)
-            .finish()
+            .field("Payload", &self.payload)
+            .finish_non_exhaustive()
     }
 }
 
@@ -290,7 +352,7 @@ bitflags! {
 }
 
 /// TCP header and its associated data
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TcpPacket {
     /// Source port
     pub source: u16,
@@ -312,6 +374,16 @@ pub struct TcpPacket {
     pub option_data: Option<Vec<u8>>,
     /// TCP data
     pub data: Vec<u8>,
+}
+
+impl fmt::Debug for TcpPacket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TCP Packet")
+            .field("Source Addr", &self.source)
+            .field("Dest Addr", &self.source)
+            .field("Data Len", &self.data)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Errors that can occur when parsing a TCP packet
@@ -337,16 +409,10 @@ impl TcpPacket {
         if data.len() < 20 {
             return Err(TcpParseErr::Size(data.len()));
         }
-        let source: u16 = (u16::from(data[0]) << 8) + u16::from(data[1]);
-        let dest: u16 = (u16::from(data[2]) << 8) + u16::from(data[3]);
-        let seq: u32 = (u32::from(data[4]) << 24)
-            + (u32::from(data[5]) << 16)
-            + (u32::from(data[6]) << 8)
-            + u32::from(data[7]);
-        let ack: u32 = (u32::from(data[8]) << 24)
-            + (u32::from(data[9]) << 16)
-            + (u32::from(data[10]) << 8)
-            + u32::from(data[11]);
+        let source = u16::from_be_bytes(data[0..2].try_into().unwrap());
+        let dest = u16::from_be_bytes(data[2..4].try_into().unwrap());
+        let seq = u32::from_be_bytes(data[4..8].try_into().unwrap());
+        let ack = u32::from_be_bytes(data[8..12].try_into().unwrap());
         let data_off = data[12] >> 4;
         if data_off as usize * 4 > data.len() {
             return Err(TcpParseErr::InvalidSize(data_off as usize));
@@ -357,9 +423,9 @@ impl TcpPacket {
         // The high order bits from the packet that don't match up to flags are masked out
         // so this should be completely fine.
         let flags: TcpFlags = unsafe { transmute(flag_bits) };
-        let window: u16 = (u16::from(data[14]) << 8) + u16::from(data[15]);
-        let checksum: u16 = (u16::from(data[16]) << 8) + u16::from(data[17]);
-        let urg: u16 = (u16::from(data[18]) << 8) + u16::from(data[19]);
+        let window = u16::from_be_bytes(data[14..16].try_into().unwrap());
+        let checksum = u16::from_be_bytes(data[16..18].try_into().unwrap());
+        let urg = u16::from_be_bytes(data[18..20].try_into().unwrap());
         let option_data: Option<Vec<u8>> = if data_off > 5 {
             Some(data[20..(data_off as usize) * 4].to_vec())
         } else {
@@ -410,13 +476,92 @@ impl TcpPacket {
     }
 }
 
+/// Errors that can happen while parsing a UDP packet
+#[derive(Debug, Error)]
+pub enum UdpParseErr {
+    /// Size in header is too large for passed in slice
+    #[error("Size in header did not match size of data")]
+    SizeMismatch,
+    /// The slice is less than 8 bytes, the minimum UDP packet size
+    #[error("Passed in data is not large enough for UDP header")]
+    MissingHeader,
+}
+
+/// UDP header and associated data
+pub struct UdpDatagram {
+    /// Source port
+    pub source: u16,
+    /// Destination port
+    pub dest: u16,
+    /// Packet checksum
+    pub checksum: u16,
+    /// UDP data
+    pub payload: Vec<u8>,
+}
+
+impl fmt::Debug for UdpDatagram {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UDP Packet")
+            .field("Source Port", &self.source)
+            .field("Dest Port", &self.dest)
+            .field("Data len", &self.payload.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl UdpDatagram {
+    /// Parse a udp packet from a slice of bytes
+    ///
+    /// This method will not check the checksum.
+    ///
+    /// # Errors
+    /// This method will return an error if the slice is less than 8 bytes or if the size of the length field is larger
+    /// than the length of the slice.
+    pub fn parse_from_bytes(data: &dyn AsRef<[u8]>) -> Result<Self, UdpParseErr> {
+        let data = data.as_ref();
+        if data.len() < 8 {
+            return Err(UdpParseErr::MissingHeader);
+        }
+        let source = u16::from_be_bytes(data[0..2].try_into().unwrap());
+        let dest = u16::from_be_bytes(data[2..4].try_into().unwrap());
+        let length = u16::from_be_bytes(data[4..6].try_into().unwrap()) as usize;
+        let checksum = u16::from_be_bytes(data[6..8].try_into().unwrap());
+        if !(8..data.len()).contains(&length) {
+            return Err(UdpParseErr::SizeMismatch);
+        }
+        let payload = data[8..length].to_vec();
+        Ok(Self {
+            source,
+            dest,
+            checksum,
+            payload,
+        })
+    }
+
+    /// Write packet to a pcap file
+    ///
+    /// # Errors
+    /// Will return any io errors that occur.
+    pub fn pcap_write<W: Write>(&self, f: &mut W) -> std::io::Result<()> {
+        f.write_all(&self.source.to_be_bytes())?;
+        f.write_all(&self.dest.to_be_bytes())?;
+        f.write_all(&self.payload.len().to_be_bytes())?;
+        f.write_all(&self.checksum.to_be_bytes())?;
+        f.write_all(&self.payload)?;
+        Ok(())
+    }
+}
+
 /// Write a packet capture out to a pcap file
 ///
 /// It is recommended to pass a buf writer to this function as many small writes will be made while writing the file.
 ///
 /// # Errors
 /// If any IO errors occur while writing the file, they will be returned.
-pub fn write_pcap_file<W: Write>(packets: &Vec<IpPacket>, pcap_file: &mut W) -> std::io::Result<()> {
+pub fn write_pcap_file<W: Write>(
+    packets: &Vec<IpPacket>,
+    pcap_file: &mut W,
+) -> std::io::Result<()> {
     pcap_file.write_all(&PCAP_MAGIC.to_ne_bytes())?;
     pcap_file.write_all(&2_u16.to_ne_bytes())?;
     pcap_file.write_all(&4_u16.to_ne_bytes())?;
@@ -473,14 +618,19 @@ pub fn read_pcap_file<R: Read>(pcap_file: &mut R) -> Result<Vec<IpPacket>, IpPar
     let mut packets = Vec::new();
     let mut index: usize = 24;
     while index + 16 < data_size {
-        let seconds = u32::from_ne_bytes(pcap_data[index..index+4].try_into().unwrap()) as u64;
-        let nanos = u32::from_ne_bytes(pcap_data[index+4..index+8].try_into().unwrap());
-        let time = Some(SystemTime::UNIX_EPOCH.checked_add(Duration::new(seconds, nanos)).unwrap());
-        let packet_size = u32::from_ne_bytes(pcap_data[index+8..index+12].try_into().unwrap()) as usize;
+        let seconds = u32::from_ne_bytes(pcap_data[index..index + 4].try_into().unwrap()) as u64;
+        let nanos = u32::from_ne_bytes(pcap_data[index + 4..index + 8].try_into().unwrap());
+        let time = Some(
+            SystemTime::UNIX_EPOCH
+                .checked_add(Duration::new(seconds, nanos))
+                .unwrap(),
+        );
+        let packet_size =
+            u32::from_ne_bytes(pcap_data[index + 8..index + 12].try_into().unwrap()) as usize;
         if index + 16 + packet_size > data_size {
             break;
         }
-        let packet = IpPacket::parse_from_bytes(&&pcap_data[index+16..][..packet_size], time);
+        let packet = IpPacket::parse_from_bytes(&&pcap_data[index + 16..][..packet_size], time);
         if let Ok(p) = packet {
             packets.push(p);
         }
@@ -495,10 +645,11 @@ mod ip_testing {
     use super::*;
     use std::io::Cursor;
 
-    const EMPTY_PACKET_BYTES: &[u8] = &[0x45, 0x00, 0x00, 0x28, 0xde, 0xad, 0x00, 0x00, 0x00, 0x06, 0xbe, 0xef,
-                                        0x12, 0x34, 0x56, 0x78, 0xab, 0xcd, 0xef, 0x12, 0x43, 0x21, 0xfe, 0xdc,
-                                        0xde, 0xad, 0xbe, 0xef, 0x69, 0x69, 0x69, 0x69, 0x50, 0x00, 0x10, 0x00,
-                                        0x99, 0x99, 0x00, 0x00];
+    const EMPTY_PACKET_BYTES: &[u8] = &[
+        0x45, 0x00, 0x00, 0x28, 0xde, 0xad, 0x00, 0x00, 0x00, 0x06, 0xbe, 0xef, 0x12, 0x34, 0x56,
+        0x78, 0xab, 0xcd, 0xef, 0x12, 0x43, 0x21, 0xfe, 0xdc, 0xde, 0xad, 0xbe, 0xef, 0x69, 0x69,
+        0x69, 0x69, 0x50, 0x00, 0x10, 0x00, 0x99, 0x99, 0x00, 0x00,
+    ];
 
     #[test]
     fn empty_packet() {
@@ -536,7 +687,9 @@ mod ip_testing {
     #[test]
     fn test_fuzz_crash_pcap_read() {
         use std::fs::File;
-        let mut file = File::open("fuzz/artifacts/pcap-read/crash-aef6cb9fec5fd0207962b119bae267071475e9af").unwrap();
+        let mut file =
+            File::open("test/test.pcap")
+                .unwrap();
         let _data = read_pcap_file(&mut file);
     }
 }

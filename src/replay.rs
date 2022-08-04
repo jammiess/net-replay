@@ -16,11 +16,11 @@
 //!
 //! See the [`AddressArbiter`] struct for an example implementation of the trait.
 
-use crate::ip::{IpPacket, TcpFlags};
+use crate::ip::{DataType, IpPacket, TcpFlags};
 
-use std::net::{Ipv4Addr, TcpStream};
-use std::num::NonZeroUsize;
 use std::io::{self, Read, Write};
+use std::net::Ipv4Addr;
+use std::num::NonZeroUsize;
 
 /// Enum for what to do with a packet from a capture
 #[derive(Debug)]
@@ -72,12 +72,12 @@ pub trait Arbiter {
 ///
 /// If the TCP connection ended in someway - a packet with the reset or fin flag set was seen - then this arbiter will
 /// break from the replay and the socket will be returned to the user.
-pub struct AddressArbiter {
+pub struct TCPAddressArbiter {
     client: Ipv4Addr,
     host: Ipv4Addr,
 }
 
-impl AddressArbiter {
+impl TCPAddressArbiter {
     /// Create a new Address Arbiter with the given host and client addresses
     #[must_use]
     pub fn new(client: Ipv4Addr, host: Ipv4Addr) -> Self {
@@ -85,31 +85,34 @@ impl AddressArbiter {
     }
 }
 
-impl Arbiter for AddressArbiter {
+impl Arbiter for TCPAddressArbiter {
     fn decide(&mut self, packet: &IpPacket) -> Action {
         const CONN_END: TcpFlags = TcpFlags::RST.union(TcpFlags::FIN);
 
-        // Check if this is a packet that should be sent in the replay
-        if self.host == packet.dest && self.client == packet.source {
-            // Has the right destination and source, now check that actually data was sent
-            if packet.payload.flags.contains(TcpFlags::PSH) {
-                return Action::Send(None);
+        // If the packet is not a TCP packet just skip it
+        if let DataType::TCP(ref payload) = packet.payload {
+            // Check if this is a packet that should be sent in the replay
+            if self.host == packet.dest && self.client == packet.source {
+                // Has the right destination and source, now check that actually data was sent
+                if payload.flags.contains(TcpFlags::PSH) {
+                    return Action::Send(None);
+                }
+                // Check if connection got reset and break if it did
+                if payload.flags.intersects(CONN_END) {
+                    return Action::Break;
+                }
             }
-            // Check if connection got reset and break if it did
-            if packet.payload.flags.intersects(CONN_END) {
-                return Action::Break;
-            }
-        }
 
-        // Check if the client should receive some data from the host
-        if self.host == packet.source && self.client == packet.dest {
-            // Check if any data was actually sent in this packet
-            if packet.payload.flags.contains(TcpFlags::PSH) {
-                return Action::Recv(None);
-            }
-            // Check if the connection got reset and break if it did
-            if packet.payload.flags.intersects(CONN_END) {
-                return Action::Break;
+            // Check if the client should receive some data from the host
+            if self.host == packet.source && self.client == packet.dest {
+                // Check if any data was actually sent in this packet
+                if payload.flags.contains(TcpFlags::PSH) {
+                    return Action::Recv(None);
+                }
+                // Check if the connection got reset and break if it did
+                if payload.flags.intersects(CONN_END) {
+                    return Action::Break;
+                }
             }
         }
 
@@ -121,26 +124,68 @@ impl Arbiter for AddressArbiter {
     fn update(&mut self, _data: &[u8], _original: &[u8]) {}
 }
 
-/// Replay a TCP connection with optionally modified data
+/// This is the same as [`TCPAddressArbiter`] except for UDP packets
+pub struct UDPAddressArbiter {
+    client: Ipv4Addr,
+    host: Ipv4Addr,
+}
+
+impl UDPAddressArbiter {
+    /// Create a new arbiter with the given host and client addresses
+    #[must_use]
+    pub fn new(client: Ipv4Addr, host: Ipv4Addr) -> Self {
+        Self { client, host }
+    }
+}
+
+impl Arbiter for UDPAddressArbiter {
+    fn decide(&mut self, packet: &IpPacket) -> Action {
+        // If the packet is not a UDP packet, just skip it
+        if let DataType::UDP(_) = packet.payload {
+            // Check if this is a packet that should be sent in the replay
+            if self.host == packet.dest && self.client == packet.source {
+                return Action::Send(None);
+            }
+
+            // Check if the client should receive some data from the host
+            if self.host == packet.source && self.client == packet.dest {
+                return Action::Recv(None);
+            }
+        }
+
+        // Default action is to pass
+        Action::Pass
+    }
+
+    // AddressArbiter has no internal state that needs to be updated so this method is just a no op
+    fn update(&mut self, _data: &[u8], _original: &[u8]) {}
+}
+
+/// Replay a network connection with optionally modified data
 ///
 /// Create a new replay by capturing data using [`crate::capture::Capture`] or by making a raw IP capture in wireshark.
 /// That capture can then be replayed.
 ///
-/// This struct requires an already connected tcp socket to work. The socket should be already connected to the service
+/// This struct parameterizes over the type of connection that the data is being sent over. As long as the 'connection'
+/// implements the [`Read`] and [`Write`] traits it can be used to replay a connection. This means that the connection
+/// does not necessarily need to be a socket. However, the connection being a socket is assumed throughout the rest of
+/// the documentation.
+///
+/// This struct requires an already connected socket to work. The socket should be already connected to the service
 /// you wish to replay the connection to. The socket and connection state should be in some form of initialized state
 /// that is ready for the replay. That initialization might just be connecting to the service.
-pub struct Replayer {
-    socket: TcpStream,
+pub struct Replayer<C: Read + Write> {
+    socket: C,
     packets: Vec<IpPacket>,
     arbiter: Box<dyn Arbiter>,
 }
 
-impl Replayer {
+impl<C: Read + Write> Replayer<C> {
     /// Create a new replayer struct
     ///
     /// The socket should already be connected and initialized to some extent.
     #[must_use]
-    pub fn new(socket: TcpStream, packets: Vec<IpPacket>, arbiter: Box<dyn Arbiter>) -> Self {
+    pub fn new(socket: C, packets: Vec<IpPacket>, arbiter: Box<dyn Arbiter>) -> Self {
         Self {
             socket,
             packets,
@@ -148,14 +193,14 @@ impl Replayer {
         }
     }
 
-    /// Replay a TCP connection
+    /// Replay a network connection
     ///
-    /// Replay a TCP connection based on captured packets. This function will return the TCP socket in a still
+    /// Replay a connection based on captured packets. This function will return the socket in a still
     /// connected state.
     ///
     /// # Errors
     /// This method may return any IO error that occurs during the replay.
-    pub fn replay(mut self) -> io::Result<TcpStream> {
+    pub fn replay(mut self) -> io::Result<C> {
         let mut recv_buf = Box::new([0u8; 65536]);
         for packet in &self.packets {
             match self.arbiter.decide(packet) {
@@ -164,7 +209,7 @@ impl Replayer {
                     if let Some(data) = payload {
                         self.socket.write_all(&data)?;
                     } else {
-                        self.socket.write_all(&packet.payload.data)?;
+                        self.socket.write_all(packet.payload.get_payload())?;
                     }
                 }
                 Action::Recv(read_size) => {
@@ -176,7 +221,7 @@ impl Replayer {
                         read_bytes = self.socket.read(&mut recv_buf[..])?;
                     }
                     self.arbiter
-                        .update(&recv_buf[..read_bytes], &packet.payload.data);
+                        .update(&recv_buf[..read_bytes], packet.payload.get_payload());
                 }
                 Action::Break => break,
             }
@@ -186,7 +231,7 @@ impl Replayer {
 
     /// Get the socket out of the struct
     #[must_use]
-    pub fn into_socket(self) -> TcpStream {
+    pub fn into_socket(self) -> C {
         self.socket
     }
 }
