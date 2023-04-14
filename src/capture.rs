@@ -197,7 +197,11 @@ impl Snooper {
             }
             let packet = capture.next_packet();
             if let Ok(p) = packet {
-                let packet = IpPacket::parse_from_bytes(&p.data, None);
+                let eth_type = u16::from_be_bytes(p.data[12..14].try_into().unwrap());
+                if eth_type != 0x0800 {
+                    continue 'recv_loop;
+                }
+                let packet = IpPacket::parse_from_bytes(&&p.data[14..], None);
                 if let Ok(p) = packet {
                     self.chan.send(p).unwrap();
                 }

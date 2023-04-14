@@ -23,6 +23,7 @@ fn main() {
         .unwrap();
     sleep(Duration::from_secs(5));
     let data = cap.end().unwrap();
+    println!("Captured {} packet(s)", data.len());
 
     let file = File::create("capture.pcap").unwrap();
     let mut writer = BufWriter::new(file);
