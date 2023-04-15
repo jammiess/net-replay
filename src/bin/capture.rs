@@ -18,9 +18,12 @@ fn main() {
         }
     };
 
-    let cap = Capture::new(Box::new(NoFilter), Some(iface)).start().unwrap();
+    let cap = Capture::new(Box::new(NoFilter), Some(iface.as_str().into()))
+        .start()
+        .unwrap();
     sleep(Duration::from_secs(5));
     let data = cap.end().unwrap();
+    println!("Captured {} packet(s)", data.len());
 
     let file = File::create("capture.pcap").unwrap();
     let mut writer = BufWriter::new(file);

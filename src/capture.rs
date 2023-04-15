@@ -11,7 +11,8 @@
 //! that data over a TCP connection.
 
 use crate::ip::IpPacket;
-use crate::sock::{Raw, RSockErr};
+
+use pcap::{Capture as Pcapture, Device, Inactive};
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -28,9 +29,12 @@ pub enum CaptureError {
     /// Failed to join one of the threads
     #[error("Failed to join one of the threads")]
     JoinError,
+    /// Failed to find a reasonable default device
+    #[error("Could not find a default device")]
+    NoDevice,
     /// Failed to do a socket operation
     #[error("Failed to do a socket operation")]
-    SockError(#[from] RSockErr),
+    DeviceError(#[from] pcap::Error),
 }
 
 /// Trait for filtering out the kind of packet(s) you want to store
@@ -62,7 +66,7 @@ impl Filter for NoFilter {
 /// Has all of the data needed to start a capture: the filter to use and an optional interface to bind to.
 pub struct Ready {
     filter: Box<dyn Filter>,
-    interface: Option<String>,
+    interface: Option<Device>,
 }
 
 /// Session state struct for an active capture
@@ -85,7 +89,7 @@ impl Capture<Ready> {
     ///
     /// This simply sets up a struct without actually starting to capture.
     #[must_use]
-    pub fn new(filter: Box<dyn Filter>, interface: Option<String>) -> Self {
+    pub fn new(filter: Box<dyn Filter>, interface: Option<Device>) -> Self {
         Self {
             state: Ready { filter, interface },
         }
@@ -112,8 +116,20 @@ impl Capture<Ready> {
             capture.start()
         });
 
-        let sock = Raw::new();
-        let mut sock = match sock {
+        let interface = match self.state.interface {
+            Some(d) => {
+                Pcapture::<Inactive>::from_device(d).map_err(|e| CaptureError::DeviceError(e))
+            }
+            None => match Device::lookup() {
+                Ok(od) => match od {
+                    Some(d) => Pcapture::<Inactive>::from_device(d)
+                        .map_err(|e| CaptureError::DeviceError(e)),
+                    None => Err(CaptureError::NoDevice),
+                },
+                Err(e) => Err(CaptureError::DeviceError(e)),
+            },
+        };
+        let dev = match interface {
             Ok(s) => s,
             Err(e) => {
                 // I believe the relaxed ordering is fine because the exact timing of the threads stopping is not
@@ -121,13 +137,8 @@ impl Capture<Ready> {
                 // with relaxed ordering.
                 signal.store(true, Ordering::Relaxed);
                 capture.join().map_err(|_| CaptureError::JoinError)?;
-                return Err(CaptureError::SockError(e));
+                return Err(e);
             }
-        };
-
-        if let Some(iface) = self.state.interface {
-            sock.bind_interface(&iface)
-                .map_err(CaptureError::SockError)?;
         };
 
         let snoop_signal = Arc::clone(&signal);
@@ -135,7 +146,7 @@ impl Capture<Ready> {
             let snooper = Snooper {
                 chan: send,
                 cond: snoop_signal,
-                sock,
+                dev,
             };
             snooper.start();
         });
@@ -170,20 +181,27 @@ impl Capture<Capturing> {
 struct Snooper {
     chan: Sender<IpPacket>,
     cond: Arc<AtomicBool>,
-    sock: Raw,
+    dev: Pcapture<Inactive>,
 }
 
 impl Snooper {
     fn start(mut self) {
-        const RECV_WAIT: Duration = Duration::new(0, 50_000_000);
-        let mut buf = Box::new([0u8; 65536]);
+        self.dev = self.dev.timeout(50);
+        let mut capture = match self.dev.open() {
+            Ok(started) => started,
+            Err(_) => return,
+        };
         'recv_loop: loop {
             if self.cond.load(Ordering::Relaxed) {
                 break 'recv_loop;
             }
-            let try_recv = self.sock.read_timeout(&mut buf[..], &RECV_WAIT);
-            if let Ok(n) = try_recv {
-                let packet = IpPacket::parse_from_bytes(&&buf[0..n], None);
+            let packet = capture.next_packet();
+            if let Ok(p) = packet {
+                let eth_type = u16::from_be_bytes(p.data[12..14].try_into().unwrap());
+                if eth_type != 0x0800 {
+                    continue 'recv_loop;
+                }
+                let packet = IpPacket::parse_from_bytes(&&p.data[14..], None);
                 if let Ok(p) = packet {
                     self.chan.send(p).unwrap();
                 }
@@ -208,8 +226,7 @@ impl Store {
             }
             let packet = self.chan.recv_timeout(RECV_WAIT);
             match packet {
-                Err(RecvTimeoutError::Timeout) => {
-                },
+                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break 'recv_loop,
                 Ok(ip_packet) => {
                     if self.filter.filter(&ip_packet) {

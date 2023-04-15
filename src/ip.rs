@@ -687,9 +687,7 @@ mod ip_testing {
     #[test]
     fn test_fuzz_crash_pcap_read() {
         use std::fs::File;
-        let mut file =
-            File::open("test/test.pcap")
-                .unwrap();
+        let mut file = File::open("test/test.pcap").unwrap();
         let _data = read_pcap_file(&mut file);
     }
 }
