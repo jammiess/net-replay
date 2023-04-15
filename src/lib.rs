@@ -8,7 +8,7 @@
 //! Lastly, [`replay`] can be used to replay a captured TCP stream to any host.
 
 pub use pcap::Device;
-#[cfg(target_os = "linux")]
 pub mod capture;
 pub mod ip;
 pub mod replay;
+mod pcapng;
